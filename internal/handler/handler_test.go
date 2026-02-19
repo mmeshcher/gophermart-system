@@ -95,6 +95,7 @@ func TestRegister_Success(t *testing.T) {
 	h.Register(rec, req)
 
 	res := rec.Result()
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusOK)
 	}
@@ -117,6 +118,7 @@ func TestLogin_UnauthorizedOnError(t *testing.T) {
 	h.Login(rec, req)
 
 	res := rec.Result()
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusUnauthorized)
 	}
@@ -132,7 +134,9 @@ func TestGetOrders_NoContent(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	h.authMiddleware.SetAuthCookie(rec, 1)
-	cookie := rec.Result().Cookies()[0]
+	resCookies := rec.Result()
+	defer resCookies.Body.Close()
+	cookie := resCookies.Cookies()[0]
 
 	req.AddCookie(cookie)
 	respRec := httptest.NewRecorder()
@@ -141,6 +145,7 @@ func TestGetOrders_NoContent(t *testing.T) {
 	handlerWithAuth.ServeHTTP(respRec, req)
 
 	res := respRec.Result()
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusNoContent)
 	}
@@ -163,7 +168,9 @@ func TestGetWithdrawals_JSONResponse(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	h.authMiddleware.SetAuthCookie(rec, 1)
-	cookie := rec.Result().Cookies()[0]
+	resCookies := rec.Result()
+	defer resCookies.Body.Close()
+	cookie := resCookies.Cookies()[0]
 	req.AddCookie(cookie)
 
 	respRec := httptest.NewRecorder()
@@ -171,6 +178,7 @@ func TestGetWithdrawals_JSONResponse(t *testing.T) {
 	handlerWithAuth.ServeHTTP(respRec, req)
 
 	res := respRec.Result()
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusOK)
 	}

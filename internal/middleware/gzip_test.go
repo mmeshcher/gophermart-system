@@ -143,9 +143,9 @@ func TestGzipMiddleware(t *testing.T) {
 			var body []byte
 			var err error
 			if res.Header.Get("Content-Encoding") == "gzip" {
-				gr, err := gzip.NewReader(res.Body)
-				if err != nil {
-					t.Fatalf("new gzip reader: %v", err)
+				gr, gzErr := gzip.NewReader(res.Body)
+				if gzErr != nil {
+					t.Fatalf("new gzip reader: %v", gzErr)
 				}
 				defer gr.Close()
 				body, err = io.ReadAll(gr)
@@ -162,4 +162,3 @@ func TestGzipMiddleware(t *testing.T) {
 		})
 	}
 }
-

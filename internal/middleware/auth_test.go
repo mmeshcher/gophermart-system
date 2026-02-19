@@ -26,6 +26,7 @@ func TestAuthMiddleware_WithValidCookie(t *testing.T) {
 
 	m.SetAuthCookie(w, 42)
 	res := w.Result()
+	defer res.Body.Close()
 	resCookies := res.Cookies()
 	if len(resCookies) == 0 {
 		t.Fatalf("no cookies set by SetAuthCookie")
@@ -55,8 +56,8 @@ func TestAuthMiddleware_WithoutCookie(t *testing.T) {
 	handler.ServeHTTP(w, r)
 
 	res := w.Result()
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", res.StatusCode, http.StatusUnauthorized)
 	}
 }
-
