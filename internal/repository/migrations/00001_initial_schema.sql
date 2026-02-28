@@ -1,3 +1,4 @@
+-- +goose Up
 CREATE TABLE IF NOT EXISTS users (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     login VARCHAR(255) NOT NULL UNIQUE,
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS withdrawals (
 
 CREATE INDEX IF NOT EXISTS idx_withdrawals_user_id ON withdrawals(user_id);
 
+-- +goose Down
 DROP TABLE IF EXISTS withdrawals;
 DROP TABLE IF EXISTS orders;
 DROP TABLE IF EXISTS users;
