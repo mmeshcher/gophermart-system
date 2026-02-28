@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/mmeshcher/gophermart-system/internal/accrual"
 	"github.com/mmeshcher/gophermart-system/internal/config"
@@ -20,10 +22,7 @@ import (
 )
 
 func main() {
-	logger, err := zap.NewDevelopment()
-	if err != nil {
-		panic(err)
-	}
+	logger, _ := zap.NewProduction()
 	defer logger.Sync()
 
 	sugar := logger.Sugar()
@@ -60,21 +59,39 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	svc.StartAccrualUpdates(ctx)
+	g, ctx := errgroup.WithContext(ctx)
 
-	go func() {
+	// Запуск фонового процесса обновления начислений
+	g.Go(func() error {
+		svc.StartAccrualUpdates(ctx)
+		return nil
+	})
+
+	// Запуск HTTP-сервера
+	g.Go(func() error {
 		sugar.Infow("starting gophermart server", "addr", cfg.RunAddress)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			sugar.Fatalw("server error", "error", err.Error())
+			return fmt.Errorf("server error: %w", err)
 		}
-	}()
+		return nil
+	})
 
-	<-ctx.Done()
+	// Graceful shutdown при отмене контекста (сигнал или ошибка в другой горутине)
+	g.Go(func() error {
+		<-ctx.Done()
+		sugar.Info("shutting down server...")
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		sugar.Errorw("server shutdown error", "error", err.Error())
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			return fmt.Errorf("server shutdown error: %w", err)
+		}
+		sugar.Info("server stopped gracefully")
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		sugar.Fatalw("application terminated with error", "error", err)
 	}
 }

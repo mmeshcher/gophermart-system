@@ -4,6 +4,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -64,10 +65,11 @@ func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
 
 	userID, err := h.service.RegisterUser(r.Context(), req.Login, req.Password)
 	if err != nil {
-		if err == repository.ErrUserExists {
+		if errors.Is(err, repository.ErrUserExists) {
 			http.Error(w, http.StatusText(http.StatusConflict), http.StatusConflict)
 			return
 		}
+		h.logger.Error("register user error", zap.Error(err))
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
@@ -91,7 +93,12 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 
 	userID, err := h.service.AuthenticateUser(r.Context(), req.Login, req.Password)
 	if err != nil {
-		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+		if err == repository.ErrUserNotFound || err.Error() == "invalid credentials" {
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		h.logger.Error("login user error", zap.Error(err))
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
 
@@ -128,6 +135,7 @@ func (h *Handler) UploadOrder(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(http.StatusConflict), http.StatusConflict)
 			return
 		}
+		h.logger.Error("upload order error", zap.Error(err), zap.String("order", number))
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
@@ -157,6 +165,7 @@ func (h *Handler) GetOrders(w http.ResponseWriter, r *http.Request) {
 
 	orders, err := h.service.GetOrdersByUser(r.Context(), userID)
 	if err != nil {
+		h.logger.Error("get orders error", zap.Error(err), zap.Int64("userID", userID))
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
@@ -193,6 +202,7 @@ func (h *Handler) GetBalance(w http.ResponseWriter, r *http.Request) {
 
 	balance, err := h.service.GetBalance(r.Context(), userID)
 	if err != nil {
+		h.logger.Error("get balance error", zap.Error(err), zap.Int64("userID", userID))
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
@@ -239,6 +249,7 @@ func (h *Handler) Withdraw(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(http.StatusPaymentRequired), http.StatusPaymentRequired)
 			return
 		}
+		h.logger.Error("withdraw error", zap.Error(err), zap.Int64("userID", userID), zap.String("order", req.Order))
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
@@ -262,6 +273,7 @@ func (h *Handler) GetWithdrawals(w http.ResponseWriter, r *http.Request) {
 
 	withdrawals, err := h.service.GetWithdrawalsByUser(r.Context(), userID)
 	if err != nil {
+		h.logger.Error("get withdrawals error", zap.Error(err), zap.Int64("userID", userID))
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}

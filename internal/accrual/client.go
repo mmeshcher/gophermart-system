@@ -4,17 +4,32 @@ package accrual
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/go-retryablehttp"
 )
+
+// ErrOrderNotFound возвращается, если информация о заказе не найдена.
+var ErrOrderNotFound = errors.New("order not found in accrual system")
+
+// TooManyRequestsError описывает ошибку превышения лимита запросов.
+type TooManyRequestsError struct {
+	RetryAfter time.Duration
+}
+
+func (e *TooManyRequestsError) Error() string {
+	return fmt.Sprintf("too many requests, retry after %s", e.RetryAfter)
+}
 
 // Client инкапсулирует HTTP-взаимодействие с системой начислений.
 type Client struct {
 	baseURL    string
-	httpClient *http.Client
+	httpClient *retryablehttp.Client
 }
 
 // OrderAccrual описывает ответ системы начислений по одному заказу.
@@ -26,18 +41,34 @@ type OrderAccrual struct {
 
 // NewClient создаёт HTTP-клиент для обращения к системе начислений по указанному адресу.
 func NewClient(baseURL string) *Client {
+	retryClient := retryablehttp.NewClient()
+	retryClient.RetryMax = 3
+	retryClient.RetryWaitMin = 1 * time.Second
+	retryClient.RetryWaitMax = 2 * time.Second
+	// Отключаем логгирование retryablehttp, чтобы оно не мешало основному логгеру
+	retryClient.Logger = nil
+
+	// Кастомная проверка для 429, чтобы не ретраить её автоматически, а вернуть ошибку сразу
+	retryClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		if err != nil {
+			return true, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return false, nil
+		}
+		return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+	}
+
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
-		},
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		httpClient: retryClient,
 	}
 }
 
 // GetOrderAccrual запрашивает информацию о начислении баллов для указанного номера заказа.
-func (c *Client) GetOrderAccrual(ctx context.Context, number string) (*OrderAccrual, int, time.Duration, error) {
+func (c *Client) GetOrderAccrual(ctx context.Context, number string) (*OrderAccrual, error) {
 	if c == nil || c.baseURL == "" {
-		return nil, 0, 0, fmt.Errorf("accrual client not configured")
+		return nil, fmt.Errorf("accrual client not configured")
 	}
 
 	base := c.baseURL
@@ -47,39 +78,39 @@ func (c *Client) GetOrderAccrual(ctx context.Context, number string) (*OrderAccr
 
 	url := fmt.Sprintf("%s/api/orders/%s", base, number)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("create request: %w", err)
+		return nil, fmt.Errorf("create request: %w", err)
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("do request: %w", err)
+		return nil, fmt.Errorf("do request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		retryAfter := time.Duration(0)
+		retryAfter := 0 * time.Second
 		if v := resp.Header.Get("Retry-After"); v != "" {
 			if seconds, parseErr := strconv.Atoi(v); parseErr == nil {
 				retryAfter = time.Duration(seconds) * time.Second
 			}
 		}
-		return nil, resp.StatusCode, retryAfter, nil
+		return nil, &TooManyRequestsError{RetryAfter: retryAfter}
 	}
 
 	if resp.StatusCode == http.StatusNoContent {
-		return nil, resp.StatusCode, 0, nil
+		return nil, ErrOrderNotFound
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, resp.StatusCode, 0, fmt.Errorf("unexpected status: %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 
 	var result OrderAccrual
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, resp.StatusCode, 0, fmt.Errorf("decode response: %w", err)
+		return nil, fmt.Errorf("decode response: %w", err)
 	}
 
-	return &result, resp.StatusCode, 0, nil
+	return &result, nil
 }

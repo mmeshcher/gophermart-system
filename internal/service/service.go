@@ -6,11 +6,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/mmeshcher/gophermart-system/internal/accrual"
 	"github.com/mmeshcher/gophermart-system/internal/model"
 	"github.com/mmeshcher/gophermart-system/internal/repository"
+)
+
+const (
+	accrualWorkerCount = 5
+	accrualBatchSize   = 50
 )
 
 // Repository описывает контракт доступа к данным, используемый сервисом.
@@ -31,6 +37,8 @@ type Repository interface {
 type Service struct {
 	repo          Repository
 	accrualClient *accrual.Client
+	mu            sync.RWMutex
+	pausedUntil   time.Time
 }
 
 // NewService создаёт новый сервис с указанным репозиторием и клиентом системы начислений.
@@ -54,9 +62,6 @@ func (s *Service) RegisterUser(ctx context.Context, login, password string) (int
 	hashed := hashPassword(login, password)
 	id, err := s.repo.CreateUser(ctx, login, hashed)
 	if err != nil {
-		if errors.Is(err, repository.ErrUserExists) {
-			return 0, repository.ErrUserExists
-		}
 		return 0, err
 	}
 	return id, nil
@@ -124,7 +129,32 @@ func (s *Service) StartAccrualUpdates(ctx context.Context) {
 		return
 	}
 
+	ordersChan := make(chan repository.OrderForAccrual, accrualBatchSize)
+
+	var wg sync.WaitGroup
+
+	// Запуск воркеров
+	for i := 0; i < accrualWorkerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case order, ok := <-ordersChan:
+					if !ok {
+						return
+					}
+					s.processOrder(ctx, order)
+				}
+			}
+		}()
+	}
+
+	// Поставщик заказов
 	go func() {
+		defer close(ordersChan)
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
@@ -133,63 +163,78 @@ func (s *Service) StartAccrualUpdates(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.processAccrualBatch(ctx)
+				s.mu.RLock()
+				paused := time.Now().Before(s.pausedUntil)
+				s.mu.RUnlock()
+
+				if paused {
+					continue
+				}
+
+				orders, err := s.repo.GetOrdersForAccrual(ctx, accrualBatchSize)
+				if err != nil {
+					continue
+				}
+
+				for _, o := range orders {
+					select {
+					case <-ctx.Done():
+						return
+					case ordersChan <- o:
+					}
+				}
 			}
 		}
 	}()
+
+	// Ожидание завершения воркеров при отмене контекста
+	go func() {
+		<-ctx.Done()
+		wg.Wait()
+	}()
 }
 
-func (s *Service) processAccrualBatch(ctx context.Context) {
-	orders, err := s.repo.GetOrdersForAccrual(ctx, 100)
-	if err != nil {
+func (s *Service) processOrder(ctx context.Context, o repository.OrderForAccrual) {
+	s.mu.RLock()
+	paused := time.Now().Before(s.pausedUntil)
+	s.mu.RUnlock()
+
+	if paused {
 		return
 	}
 
-	for _, o := range orders {
-		resp, statusCode, retryAfter, err := s.accrualClient.GetOrderAccrual(ctx, o.Number)
-		if err != nil {
-			continue
+	resp, err := s.accrualClient.GetOrderAccrual(ctx, o.Number)
+	if err != nil {
+		var tooManyErr *accrual.TooManyRequestsError
+		if errors.As(err, &tooManyErr) {
+			s.mu.Lock()
+			s.pausedUntil = time.Now().Add(tooManyErr.RetryAfter)
+			s.mu.Unlock()
 		}
-
-		if statusCode == 0 {
-			continue
-		}
-
-		if statusCode == 429 {
-			if retryAfter > 0 {
-				timer := time.NewTimer(retryAfter)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
-				}
-			}
-			continue
-		}
-
-		if resp == nil {
-			continue
-		}
-
-		var status model.OrderStatus
-		var accrualCents *int64
-
-		switch resp.Status {
-		case "REGISTERED", "PROCESSING":
-			status = model.OrderStatusProcessing
-		case "INVALID":
-			status = model.OrderStatusInvalid
-		case "PROCESSED":
-			status = model.OrderStatusProcessed
-			if resp.Accrual != nil {
-				v := int64(*resp.Accrual * 100)
-				accrualCents = &v
-			}
-		default:
-			continue
-		}
-
-		_ = s.repo.UpdateOrderAccrual(ctx, o.Number, status, accrualCents)
+		return
 	}
+
+	if resp == nil {
+		return
+	}
+
+	var status model.OrderStatus
+	var accrualCents *int64
+
+	switch resp.Status {
+	case "REGISTERED", "PROCESSING":
+		status = model.OrderStatusProcessing
+	case "INVALID":
+		status = model.OrderStatusInvalid
+	case "PROCESSED":
+		status = model.OrderStatusProcessed
+		if resp.Accrual != nil {
+			v := int64(*resp.Accrual * 100)
+			accrualCents = &v
+		}
+	default:
+		return
+	}
+
+	_ = s.repo.UpdateOrderAccrual(ctx, o.Number, status, accrualCents)
 }

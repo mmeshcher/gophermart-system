@@ -3,6 +3,7 @@ package accrual
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -35,15 +36,9 @@ func TestGetOrderAccrual_OK(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	res, code, retry, err := client.GetOrderAccrual(ctx, "123")
+	res, err := client.GetOrderAccrual(ctx, "123")
 	if err != nil {
 		t.Fatalf("GetOrderAccrual error: %v", err)
-	}
-	if code != http.StatusOK {
-		t.Fatalf("status code = %d, want %d", code, http.StatusOK)
-	}
-	if retry != 0 {
-		t.Fatalf("retryAfter = %v, want 0", retry)
 	}
 	if res == nil || res.Order != "123" || res.Status != "PROCESSED" {
 		t.Fatalf("unexpected response: %+v", res)
@@ -55,28 +50,27 @@ func TestGetOrderAccrual_OK(t *testing.T) {
 
 func TestGetOrderAccrual_TooManyRequests(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Retry-After", "5")
+		w.Header().Set("Retry-After", "1")
 		w.WriteHeader(http.StatusTooManyRequests)
 	}))
 	defer ts.Close()
 
 	client := NewClient(ts.URL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	res, code, retry, err := client.GetOrderAccrual(ctx, "123")
-	if err != nil {
-		t.Fatalf("GetOrderAccrual error: %v", err)
+	_, err := client.GetOrderAccrual(ctx, "123")
+	if err == nil {
+		t.Fatal("expected error for 429, got nil")
 	}
-	if res != nil {
-		t.Fatalf("expected nil response for 429, got %+v", res)
+
+	var tooManyErr *TooManyRequestsError
+	if !errors.As(err, &tooManyErr) {
+		t.Fatalf("expected TooManyRequestsError, got %T: %v", err, err)
 	}
-	if code != http.StatusTooManyRequests {
-		t.Fatalf("status code = %d, want %d", code, http.StatusTooManyRequests)
-	}
-	if retry < 5*time.Second {
-		t.Fatalf("retryAfter = %v, want at least 5s", retry)
+	if tooManyErr.RetryAfter != 1*time.Second {
+		t.Fatalf("retryAfter = %v, want 1s", tooManyErr.RetryAfter)
 	}
 }
 
@@ -91,22 +85,15 @@ func TestGetOrderAccrual_NoContent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	res, code, retry, err := client.GetOrderAccrual(ctx, "123")
-	if err != nil {
-		t.Fatalf("GetOrderAccrual error: %v", err)
+	_, err := client.GetOrderAccrual(ctx, "123")
+	if err == nil {
+		t.Fatal("expected error for 204, got nil")
 	}
-	if res != nil {
-		t.Fatalf("expected nil response for 204, got %+v", res)
-	}
-	if code != http.StatusNoContent {
-		t.Fatalf("status code = %d, want %d", code, http.StatusNoContent)
-	}
-	if retry != 0 {
-		t.Fatalf("retryAfter = %v, want 0", retry)
+	if !errors.Is(err, ErrOrderNotFound) {
+		t.Fatalf("expected ErrOrderNotFound, got %v", err)
 	}
 }
 
 func ptrFloat(v float64) *float64 {
 	return &v
 }
-

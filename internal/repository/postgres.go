@@ -3,16 +3,23 @@ package repository
 
 import (
 	"context"
+	"embed"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/mmeshcher/gophermart-system/internal/model"
+	"github.com/pressly/goose/v3"
 )
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
 
 // ErrUserExists возвращается при попытке создать пользователя с уже существующим логином.
 var (
@@ -30,7 +37,7 @@ type PostgresRepository struct {
 	pool *pgxpool.Pool
 }
 
-// NewPostgresRepository создаёт новый репозиторий и инициализирует схему БД.
+// NewPostgresRepository создаёт новый репозиторий и инициализирует схему БД через миграции.
 func NewPostgresRepository(dsn string) (*PostgresRepository, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -52,7 +59,7 @@ func NewPostgresRepository(dsn string) (*PostgresRepository, error) {
 
 	r := &PostgresRepository{pool: pool}
 
-	if err := r.initSchema(context.Background()); err != nil {
+	if err := r.runMigrations(ctx); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -60,38 +67,70 @@ func NewPostgresRepository(dsn string) (*PostgresRepository, error) {
 	return r, nil
 }
 
-func (r *PostgresRepository) initSchema(ctx context.Context) error {
-	schemaQueries := []string{
-		`CREATE TABLE IF NOT EXISTS users (
-			id BIGSERIAL PRIMARY KEY,
-			login TEXT NOT NULL UNIQUE,
-			password_hash BYTEA NOT NULL,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE TABLE IF NOT EXISTS orders (
-			id BIGSERIAL PRIMARY KEY,
-			number TEXT NOT NULL UNIQUE,
-			user_id BIGINT NOT NULL REFERENCES users(id),
-			status TEXT NOT NULL,
-			accrual BIGINT,
-			uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
-		`CREATE TABLE IF NOT EXISTS withdrawals (
-			id BIGSERIAL PRIMARY KEY,
-			user_id BIGINT NOT NULL REFERENCES users(id),
-			order_number TEXT NOT NULL UNIQUE,
-			sum BIGINT NOT NULL,
-			processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)`,
+func (r *PostgresRepository) runMigrations(ctx context.Context) error {
+	db := stdlib.OpenDBFromPool(r.pool)
+	defer db.Close()
+
+	goose.SetBaseFS(migrationsFS)
+
+	if err := goose.SetDialect("postgres"); err != nil {
+		return fmt.Errorf("set dialect: %w", err)
 	}
 
-	for _, q := range schemaQueries {
-		if _, err := r.pool.Exec(ctx, q); err != nil {
-			return fmt.Errorf("init schema: %w", err)
-		}
+	if err := goose.UpContext(ctx, db, "migrations"); err != nil {
+		return fmt.Errorf("run migrations: %w", err)
 	}
 
 	return nil
+}
+
+func (r *PostgresRepository) withRetry(ctx context.Context, fn func() error) error {
+	var err error
+	delays := []time.Duration{1 * time.Second, 3 * time.Second, 5 * time.Second}
+
+	for i := 0; i <= len(delays); i++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+
+		// Если ошибка контекста — выходим сразу
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+
+		// Проверяем, является ли ошибка временной (сетевой)
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			// Можно добавить коды ошибок, которые стоит ретраить (например, Connection Failure)
+			// Но обычно pgxpool сам справляется с переподключением.
+			// Ретраи полезны для Serialization Failure или Deadlocks.
+			if pgErr.Code == pgerrcode.SerializationFailure || pgErr.Code == pgerrcode.DeadlockDetected {
+				if i < len(delays) {
+					time.Sleep(delays[i])
+					continue
+				}
+			}
+		}
+
+		// Если это не pg-ошибка, но сетевая
+		if isConnectionError(err) {
+			if i < len(delays) {
+				time.Sleep(delays[i])
+				continue
+			}
+		}
+
+		break
+	}
+	return err
+}
+
+func isConnectionError(err error) bool {
+	// Упрощенная проверка на ошибки соединения
+	return strings.Contains(err.Error(), "connection refused") ||
+		strings.Contains(err.Error(), "broken pipe") ||
+		strings.Contains(err.Error(), "connection reset by peer")
 }
 
 // Close закрывает пул соединений с БД.
@@ -110,7 +149,7 @@ func (r *PostgresRepository) CreateUser(ctx context.Context, login string, passw
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.UniqueViolation {
-			return 0, ErrUserExists
+			return 0, fmt.Errorf("%w: %s", ErrUserExists, login)
 		}
 		return 0, fmt.Errorf("create user: %w", err)
 	}
@@ -253,13 +292,20 @@ func (r *PostgresRepository) GetBalance(ctx context.Context, userID int64) (int6
 	return current, withdrawnTotal, nil
 }
 
-// CreateWithdrawal создаёт запись о списании средств.
+// CreateWithdrawal создаёт запись о списании средств. Использует блокировку строки пользователя для сериализации списаний.
 func (r *PostgresRepository) CreateWithdrawal(ctx context.Context, userID int64, orderNumber string, sumCents int64) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	// Блокируем строку пользователя для предотвращения параллельных списаний, превышающих баланс.
+	var dummy int
+	err = tx.QueryRow(ctx, `SELECT 1 FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&dummy)
+	if err != nil {
+		return fmt.Errorf("lock user for update: %w", err)
+	}
 
 	var accrualTotal int64
 	err = tx.QueryRow(ctx,

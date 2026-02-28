@@ -5,7 +5,7 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/caarlos0/env/v6"
+	"github.com/caarlos0/env/v11"
 )
 
 // Config содержит параметры конфигурации сервиса гофермарт.
